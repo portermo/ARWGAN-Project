@@ -9,18 +9,19 @@
 
 # 核心套件
 Pillow==7.2.0
-numpy
-kornia
+numpy<2.0  # 重要: 必須使用 1.x 版本以相容 PyTorch 1.12.1
+kornia<0.7  # 使用與 PyTorch 1.12.1 相容的版本
 tensorboard
 kagglehub
 
 # PyTorch 安裝說明:
-# - 對於 Python 3.7-3.10 + CUDA 10.2:
+# - 推薦使用 PyTorch 2.x 以支援新款 GPU (如 RTX 4090):
+#   pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cu118
+# - 或使用升級腳本:
+#   ./upgrade_pytorch.sh
+# 
+# - 舊版本 PyTorch 1.12.1 (不支援 RTX 4090):
 #   pip install torch==1.12.1+cu102 torchvision==0.13.1+cu102 --extra-index-url https://download.pytorch.org/whl/cu102
-# - 對於 Python 3.7-3.10 + CPU:
-#   pip install torch==1.12.1 torchvision==0.13.1
-# - 對於 Python 3.11+ (可能會有相容性問題):
-#   pip install torch torchvision
 
 # 注意: 程式碼中使用了 tensorboard_logger，這可能需要額外的套件
 # 如果遇到 import 錯誤，可能需要安裝: pip install tensorboardX

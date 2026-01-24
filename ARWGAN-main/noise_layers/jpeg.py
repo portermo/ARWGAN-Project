@@ -12,15 +12,15 @@ class DiffJPEG(nn.Module):
     
     def __init__(self, factor=1.0):
         super(DiffJPEG, self).__init__()
-        
+
         # Register quantization factor (can be learned or fixed)
         self.factor = factor
-        
+
         # Pre-calculate DCT basis matrices (8x8)
         # These are registered as buffers so they move with the model
-        self.register_buffer('dct_weights', self._build_dct_matrix())
-        self.register_buffer('y_quant_table', self._build_y_quant_table())
-        self.register_buffer('c_quant_table', self._build_c_quant_table())
+        self.register_buffer('dct_weights', self._build_dct_matrix(), persistent=True)
+        self.register_buffer('y_quant_table', self._build_y_quant_table(), persistent=True)
+        self.register_buffer('c_quant_table', self._build_c_quant_table(), persistent=True)
         
     def _build_dct_matrix(self):
         """Build 8x8 DCT transformation matrix (64x64)."""

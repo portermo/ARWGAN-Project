@@ -12,20 +12,25 @@ class Noiser(nn.Module):
     """
     def __init__(self, noise_layers: list, device):
         super(Noiser, self).__init__()
-        self.noise_layers = [Identity()]
-
+        self.device = device
+        
+        # 使用 ModuleList 以確保子模組正確跟隨設備
+        layers_list = [Identity()]
 
         for layer in noise_layers:
             if type(layer) is str:
                 if layer == 'JpegPlaceholder':
-                    self.noise_layers.append(JpegCompression(device))
+                    layers_list.append(JpegCompression(device))
                 elif layer == 'QuantizationPlaceholder':
-                    self.noise_layers.append(Quantization(device))
+                    layers_list.append(Quantization(device))
                 else:
                     raise ValueError(f'Wrong layer placeholder string in Noiser.__init__().'
                                      f' Expected "JpegPlaceholder" or "QuantizationPlaceholder" but got {layer} instead')
             else:
-                self.noise_layers.append(layer)
+                layers_list.append(layer)
+        
+        # 使用 ModuleList 註冊所有噪聲層
+        self.noise_layers = nn.ModuleList(layers_list)
         # self.noise_layers = nn.Sequential(*noise_layers)
 
     def forward(self, encoded_and_cover):
