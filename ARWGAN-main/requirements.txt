@@ -1,0 +1,26 @@
+# 根據 README 和程式碼分析所需的套件
+# 
+# ⚠️ 重要: Python 版本相容性問題
+# README 要求 Python 3.7.4，但 PyTorch 1.12.1 只支援到 Python 3.10
+# 如果使用 Python 3.11+，需要安裝較新版本的 PyTorch (可能會有相容性問題)
+#
+# 建議: 使用 Python 3.7-3.10 建立虛擬環境以符合原始要求
+# 如果必須使用 Python 3.11+，請安裝較新版本的 PyTorch
+
+# 核心套件
+Pillow==7.2.0
+numpy
+kornia
+tensorboard
+kagglehub
+
+# PyTorch 安裝說明:
+# - 對於 Python 3.7-3.10 + CUDA 10.2:
+#   pip install torch==1.12.1+cu102 torchvision==0.13.1+cu102 --extra-index-url https://download.pytorch.org/whl/cu102
+# - 對於 Python 3.7-3.10 + CPU:
+#   pip install torch==1.12.1 torchvision==0.13.1
+# - 對於 Python 3.11+ (可能會有相容性問題):
+#   pip install torch torchvision
+
+# 注意: 程式碼中使用了 tensorboard_logger，這可能需要額外的套件
+# 如果遇到 import 錯誤，可能需要安裝: pip install tensorboardX
