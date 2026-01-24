@@ -1,6 +1,10 @@
 import torch.nn as nn
 import torch
-from kornia.color.adjust import AdjustHue,AdjustSaturation,AdjustContrast,AdjustBrightness,AdjustGamma
+# kornia 0.7+ 使用 kornia.enhance 代替 kornia.color.adjust
+try:
+    from kornia.enhance import AdjustHue, AdjustSaturation, AdjustContrast, AdjustBrightness, AdjustGamma
+except ImportError:
+    from kornia.color.adjust import AdjustHue, AdjustSaturation, AdjustContrast, AdjustBrightness, AdjustGamma
 import math
 from torchvision.transforms import ToPILImage
 class Adjust_hue(nn.Module):
