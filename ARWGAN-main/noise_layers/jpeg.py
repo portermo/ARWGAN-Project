@@ -1,238 +1,302 @@
-import itertools
-
-import numpy as np
 import torch
-import torch.nn.functional as F
-import utils
 import torch.nn as nn
-
-def rgb_to_ycbcr_jpeg(image):
-    return utils.rgb_to_ycbcr(image)
-
-
-# 2. Chroma subsampling
-def downsampling_420(image):
-    # input: batch x height x width x 3
-    # output: tuple of length 3
-    #   y:  batch x height x width
-    #   cb: batch x height/2 x width/2
-    #   cr: batch x height/2 x width/2
-    y, cb, cr = torch.split(image, 1, dim=1)
-    cb = F.avg_pool2d(cb, kernel_size=2, stride=2)
-    cr = F.avg_pool2d(cr, kernel_size=2, stride=2)
-    return y, cb, cr
+import torch.nn.functional as F
+import numpy as np
 
 
-# 3. Block splitting
-def image_to_patches(image):
-    # input: batch x h x w
-    # output: batch x h*w/64 x h x w
-    # input: batch x h x w
-    # output: batch x h*w/64 x h x w
-    k = 8
-    b, c, h, w = image.size()
-    image_reshaped = torch.reshape(image, [b, h // k, k, -1, k])
-    image_transposed = image_reshaped.permute((0, 1, 3, 2, 4))
-    return torch.reshape(image_transposed, [b, -1, k, k])
+class DiffJPEG(nn.Module):
+    """
+    Differentiable JPEG compression layer implemented in pure PyTorch.
+    Fully vectorized, no loops (except initialization), GPU-optimized.
+    """
+    
+    def __init__(self, factor=1.0):
+        super(DiffJPEG, self).__init__()
+
+        # Register quantization factor (can be learned or fixed)
+        self.factor = factor
+
+        # Pre-calculate DCT basis matrices (8x8)
+        # These are registered as buffers so they move with the model
+        self.register_buffer('dct_weights', self._build_dct_matrix(), persistent=True)
+        self.register_buffer('y_quant_table', self._build_y_quant_table(), persistent=True)
+        self.register_buffer('c_quant_table', self._build_c_quant_table(), persistent=True)
+        
+    def _build_dct_matrix(self):
+        """Build 8x8 DCT transformation matrix (64x64)."""
+        # Create DCT basis: C(u,v) = alpha(u) * alpha(v) * cos((2x+1)u*pi/16) * cos((2y+1)v*pi/16)
+        # where alpha(0) = 1/sqrt(2), alpha(k) = 1 for k > 0
+        n = 8
+        dct_matrix = torch.zeros(n * n, n * n, dtype=torch.float32)
+        
+        # Build DCT matrix: maps 8x8 pixel blocks to 8x8 DCT coefficients
+        for u in range(n):
+            for v in range(n):
+                alpha_u = 1.0 / np.sqrt(2.0) if u == 0 else 1.0
+                alpha_v = 1.0 / np.sqrt(2.0) if v == 0 else 1.0
+                alpha = alpha_u * alpha_v * 0.25
+                
+                for x in range(n):
+                    for y in range(n):
+                        dct_val = alpha * np.cos((2 * x + 1) * u * np.pi / 16) * np.cos((2 * y + 1) * v * np.pi / 16)
+                        # Map 2D position (x,y) to 1D index (row-major)
+                        idx_in = x * n + y
+                        # Map 2D frequency (u,v) to 1D index (row-major)
+                        idx_out = u * n + v
+                        dct_matrix[idx_out, idx_in] = dct_val
+        
+        # IDCT is the transpose of DCT (for orthonormal DCT)
+        return dct_matrix
+    
+    def _build_y_quant_table(self):
+        """Build luminance quantization table (standard JPEG)."""
+        y_table = np.array([
+            [16, 11, 10, 16, 24, 40, 51, 61],
+            [12, 12, 14, 19, 26, 58, 60, 55],
+            [14, 13, 16, 24, 40, 57, 69, 56],
+            [14, 17, 22, 29, 51, 87, 80, 62],
+            [18, 22, 37, 56, 68, 109, 103, 77],
+            [24, 35, 55, 64, 81, 104, 113, 92],
+            [49, 64, 78, 87, 103, 121, 120, 101],
+            [72, 92, 95, 98, 112, 100, 103, 99]
+        ], dtype=np.float32).T
+        return torch.from_numpy(y_table)
+    
+    def _build_c_quant_table(self):
+        """Build chrominance quantization table (standard JPEG)."""
+        c_table = np.full((8, 8), 99, dtype=np.float32)
+        c_table[:4, :4] = np.array([
+            [17, 18, 24, 47],
+            [18, 21, 26, 66],
+            [24, 26, 56, 99],
+            [47, 66, 99, 99]
+        ], dtype=np.float32).T
+        return torch.from_numpy(c_table)
+    
+    def _rgb_to_ycbcr(self, image):
+        """Convert RGB to YCbCr color space (vectorized, matching utils.py)."""
+        # Input: (B, 3, H, W) in range [0, 1]
+        # Output: (B, 3, H, W) with Y in [0, 1], Cb/Cr in [0.5-0.5, 0.5+0.5]
+        r, g, b = image[:, 0], image[:, 1], image[:, 2]
+        
+        # Standard ITU-R BT.601 coefficients (matching utils.py)
+        delta = 0.5
+        y = 0.299 * r + 0.587 * g + 0.114 * b
+        cb = (b - y) * 0.564 + delta
+        cr = (r - y) * 0.713 + delta
+        
+        return torch.stack([y, cb, cr], dim=1)
+    
+    def _ycbcr_to_rgb(self, image):
+        """Convert YCbCr to RGB color space (vectorized, matching utils.py)."""
+        # Input: (B, 3, H, W)
+        # Output: (B, 3, H, W) in range [0, 1]
+        y, cb, cr = image[:, 0], image[:, 1], image[:, 2]
+        
+        # Standard ITU-R BT.601 coefficients (matching utils.py)
+        delta = 0.5
+        cb_shifted = cb - delta
+        cr_shifted = cr - delta
+        
+        r = y + 1.403 * cr_shifted
+        g = y - 0.714 * cr_shifted - 0.344 * cb_shifted
+        b = y + 1.773 * cb_shifted
+        
+        return torch.clamp(torch.stack([r, g, b], dim=1), 0.0, 1.0)
+    
+    def _image_to_blocks(self, image):
+        """Split image into 8x8 blocks (vectorized)."""
+        # Input: (B, C, H, W)
+        # Output: (B, C, H//8, W//8, 8, 8)
+        B, C, H, W = image.shape
+        
+        # Pad to multiple of 8
+        pad_h = (8 - H % 8) % 8
+        pad_w = (8 - W % 8) % 8
+        if pad_h > 0 or pad_w > 0:
+            image = F.pad(image, (0, pad_w, 0, pad_h), mode='reflect')
+            H, W = H + pad_h, W + pad_w
+        
+        # Reshape to blocks: (B, C, H, W) -> (B, C, H//8, 8, W//8, 8) -> (B, C, H//8, W//8, 8, 8)
+        image = image.view(B, C, H // 8, 8, W // 8, 8)
+        image = image.permute(0, 1, 2, 4, 3, 5).contiguous()
+        return image, H, W, pad_h, pad_w
+    
+    def _blocks_to_image(self, blocks, orig_h, orig_w, pad_h, pad_w):
+        """Reconstruct image from 8x8 blocks (vectorized)."""
+        # Input: (B, C, H//8, W//8, 8, 8)
+        # Output: (B, C, orig_h, orig_w)
+        B, C, n_h, n_w, _, _ = blocks.shape
+        
+        # Reshape back: (B, C, n_h, n_w, 8, 8) -> (B, C, n_h, 8, n_w, 8) -> (B, C, n_h*8, n_w*8)
+        blocks = blocks.permute(0, 1, 2, 4, 3, 5).contiguous()
+        image = blocks.view(B, C, n_h * 8, n_w * 8)
+        
+        # Crop to original size
+        if pad_h > 0 or pad_w > 0:
+            image = image[:, :, :orig_h, :orig_w]
+        
+        return image
+    
+    def _dct_2d(self, blocks):
+        """Apply 2D DCT to 8x8 blocks using matrix multiplication (fully vectorized)."""
+        # Input: (B, C, n_h, n_w, 8, 8)
+        # Output: (B, C, n_h, n_w, 8, 8)
+        B, C, n_h, n_w, _, _ = blocks.shape
+        
+        # Flatten blocks to (B*C*n_h*n_w, 64)
+        blocks_flat = blocks.view(-1, 64)
+        
+        # Center pixel values around 0 (JPEG standard: subtract 128 from [0,255] range)
+        # Since our input is [0,1] range, we subtract 0.5 and scale to [-128, 127]
+        blocks_flat = blocks_flat * 255.0 - 128.0
+        
+        # Apply DCT: output = DCT_matrix @ input (fully vectorized matrix multiplication)
+        dct_flat = torch.matmul(self.dct_weights, blocks_flat.t()).t()
+        
+        # Reshape back
+        dct_blocks = dct_flat.view(B, C, n_h, n_w, 8, 8)
+        return dct_blocks
+    
+    def _idct_2d(self, dct_blocks):
+        """Apply 2D IDCT to 8x8 blocks using matrix multiplication (fully vectorized)."""
+        # Input: (B, C, n_h, n_w, 8, 8)
+        # Output: (B, C, n_h, n_w, 8, 8)
+        B, C, n_h, n_w, _, _ = dct_blocks.shape
+        
+        # Flatten to (B*C*n_h*n_w, 64)
+        dct_flat = dct_blocks.view(-1, 64)
+        
+        # Apply IDCT: output = DCT_matrix^T @ input (fully vectorized)
+        # Since DCT is orthonormal, IDCT = DCT^T
+        idct_flat = torch.matmul(self.dct_weights.t(), dct_flat.t()).t()
+        
+        # Scale back: add 128 and normalize to [0, 1] range
+        idct_flat = (idct_flat + 128.0) / 255.0
+        
+        # Reshape back
+        idct_blocks = idct_flat.view(B, C, n_h, n_w, 8, 8)
+        return idct_blocks
+    
+    def _quantize(self, dct_blocks, quant_table):
+        """Differentiable quantization using Straight-Through Estimator (vectorized)."""
+        # Input: (B, C, n_h, n_w, 8, 8)
+        # Quant table: (8, 8)
+        # Scale quantization table by factor
+        quant_table_scaled = quant_table * self.factor
+        
+        # Divide by quantization table (broadcasted across all dimensions)
+        quantized = dct_blocks / quant_table_scaled[None, None, None, None, :, :]
+        
+        # Differentiable rounding: use straight-through estimator
+        # Forward: round, Backward: identity
+        quantized_rounded = torch.round(quantized)
+        quantized = quantized + (quantized_rounded - quantized).detach()
+        
+        return quantized
+    
+    def _dequantize(self, quantized_blocks, quant_table):
+        """Dequantize DCT coefficients (vectorized)."""
+        # Input: (B, C, n_h, n_w, 8, 8)
+        # Quant table: (8, 8)
+        quant_table_scaled = quant_table * self.factor
+        
+        # Multiply by quantization table (broadcasted)
+        dequantized = quantized_blocks * quant_table_scaled[None, None, None, None, :, :]
+        
+        return dequantized
+    
+    def forward(self, noise_and_cover):
+        """
+        Forward pass of DiffJPEG compression/decompression.
+        
+        Args:
+            noise_and_cover: Tuple/list where first element is image tensor (B, 3, H, W)
+                           Expected input range: [0, 1] (Standard for Residual Learning)
+        
+        Returns:
+            Same tuple/list with compressed/decompressed image in [0, 1] range
+        """
+        encoded_image = noise_and_cover[0]  # (B, 3, H, W)
+        
+        # 修正重點 1: 殘差連接可能會讓數值些微超出 [0, 1]，必須 Clamp (修剪)
+        # 否則進入 Log 運算或 JPEG 轉換時會出錯
+        image_01 = torch.clamp(encoded_image, 0.0, 1.0)
+        
+        # Store original shape
+        B, C, orig_h, orig_w = image_01.shape
+        
+        # Step 1: RGB -> YCbCr
+        ycbcr = self._rgb_to_ycbcr(image_01)
+        
+        # Step 2: Split into 8x8 blocks
+        blocks, H, W, pad_h, pad_w = self._image_to_blocks(ycbcr)
+        n_h, n_w = H // 8, W // 8
+        
+        # Step 3: DCT for all channels (fully vectorized)
+        dct_blocks = self._dct_2d(blocks)
+        
+        # Step 4: Quantization (Y table for channel 0, C table for channels 1,2)
+        quant_tables = torch.stack([
+            self.y_quant_table,
+            self.c_quant_table,
+            self.c_quant_table
+        ], dim=0)  # (3, 8, 8)
+        
+        # Quantize all channels at once
+        quant_table_scaled = quant_tables * self.factor
+        quant_table_expanded = quant_table_scaled[None, :, None, None, :, :]
+        quantized = dct_blocks / quant_table_expanded
+        
+        # Differentiable rounding (STE)
+        quantized_rounded = torch.round(quantized)
+        quantized = quantized + (quantized_rounded - quantized).detach()
+        
+        # Step 5: Dequantization
+        dequantized = quantized * quant_table_expanded
+        
+        # Step 6: IDCT
+        compressed_blocks = self._idct_2d(dequantized)
+        
+        # Step 7: Reconstruct image
+        compressed_ycbcr = self._blocks_to_image(compressed_blocks, orig_h, orig_w, pad_h, pad_w)
+        
+        # Step 8: YCbCr -> RGB
+        compressed_rgb_01 = self._ycbcr_to_rgb(compressed_ycbcr)
+        
+        # Ensure output is in [0, 1] range
+        compressed_rgb_01 = torch.clamp(compressed_rgb_01, 0.0, 1.0)
+        
+        # 修正重點 2: 不需要再轉回 [-1, 1]，直接輸出 [0, 1]
+        noise_and_cover[0] = compressed_rgb_01
+        
+        return noise_and_cover
 
 
-# 4. DCT
-def dct_8x8(image):
-    tensor = np.zeros((8, 8, 8, 8), dtype=np.float32)
-    for x, y, u, v in itertools.product(range(8), repeat=4):
-        tensor[x, y, u, v] = np.cos((2 * x + 1) * u * np.pi / 16) * np.cos(
-            (2 * y + 1) * v * np.pi / 16)
-    tensor = torch.from_numpy(tensor)
-
-    alpha = np.array([1. / np.sqrt(2)] + [1] * 7, dtype=np.float32)
-    scale = np.outer(alpha, alpha) * 0.25
-    scale = torch.from_numpy(scale)
-
-    image = image - 128.
-    result = scale * torch.tensordot(image, tensor, dims=2).reshape(image.size())
-    return result
-
-
-# 5. Quantizaztion
-y_table = np.array(
-    [[16, 11, 10, 16, 24, 40, 51, 61], [12, 12, 14, 19, 26, 58, 60,
-                                        55], [14, 13, 16, 24, 40, 57, 69, 56],
-     [14, 17, 22, 29, 51, 87, 80, 62], [18, 22, 37, 56, 68, 109, 103,
-                                        77], [24, 35, 55, 64, 81, 104, 113, 92],
-     [49, 64, 78, 87, 103, 121, 120, 101], [72, 92, 95, 98, 112, 100, 103, 99]],
-    dtype=np.float32).T
-y_table = torch.from_numpy(y_table)
-c_table = np.empty((8, 8), dtype=np.float32)
-c_table.fill(99)
-c_table[:4, :4] = np.array([[17, 18, 24, 47], [18, 21, 26, 66],
-                            [24, 26, 56, 99], [47, 66, 99, 99]]).T
-c_table = torch.from_numpy(c_table)
-
-def y_quantize(image, rounding, factor=1):
-    image = image / (y_table * factor)
-    image = rounding(image)
-    return image
-
-
-def c_quantize(image, rounding, factor=1):
-    image = image / (c_table * factor)
-    image = rounding(image)
-    return image
-
-
-# -5. Dequantization
-def y_dequantize(image, factor=1):
-    return image * (y_table * factor)
-
-
-def c_dequantize(image, factor=1):
-    return image * (c_table * factor)
-
-
-# -4. Inverse DC
-def idct_8x8(image):
-    tensor = np.zeros((8, 8, 8, 8), dtype=np.float32)
-    for x, y, u, v in itertools.product(range(8), repeat=4):
-        tensor[x, y, u, v] = np.cos((2 * u + 1) * x * np.pi / 16) * np.cos(
-            (2 * v + 1) * y * np.pi / 16)
-    tensor = torch.from_numpy(tensor)
-
-    alpha = np.array([1. / np.sqrt(2)] + [1] * 7, dtype=np.float32)
-    alpha = np.outer(alpha, alpha)
-    alpha = torch.from_numpy(alpha)
-
-    image = image * alpha
-    result = 0.25 * torch.tensordot(image, tensor, dims=2).reshape(image.size()) + 128
-    return result
-
-
-# -3. Block joining
-def patches_to_image(patches, height, width):
-    # input: batch x h*w/64 x h x w
-    # output: batch x h x w
-    k = 8
-    batch_size = patches.size()[0]
-    image_reshaped = torch.reshape(patches,
-                                   [batch_size, height // k, width // k, k, k])
-    image_transposed = image_reshaped.permute((0, 1, 3, 2, 4))
-    return torch.reshape(image_transposed, [batch_size, height, width])
-
-
-# -2. Chroma upsampling
-def upsampling_420(y, cb, cr):
-    # input:
-    #   y:  batch x height x width
-    #   cb: batch x height/2 x width/2
-    #   cr: batch x height/2 x width/2
-    # output:
-    #   image: batch x height x width x 3
-    def repeat(x, k=2):
-        height, width = x.size()[1:3]
-        x = torch.unsqueeze(x, 1)
-        x = x.repeat([1, 1, k, k])
-        x = torch.reshape(x, [-1, height * k, width * k])
-        return x
-
-    cb = repeat(cb)
-    cr = repeat(cr)
-    return torch.stack((y, cb, cr), dim=1)
-
-
-# -1. YCbCr -> RGB
-def ycbcr_to_rgb_jpeg(image):
-    return utils.ycbcr_to_rgb(image)
-
-
-def diff_round(x):
-    return torch.round(x) + (x - torch.round(x)) ** 3
+class Jpeg(nn.Module):
+    """
+    Wrapper class for DiffJPEG to match the original interface.
+    Accepts factor parameter (quantization scale).
+    """
+    
+    def __init__(self, factor):
+        super(Jpeg, self).__init__()
+        # Convert factor to float if it's a string
+        if isinstance(factor, str):
+            factor = float(factor)
+        self.diff_jpeg = DiffJPEG(factor=factor)
+        self.factor = factor
+    
+    def forward(self, noise_and_cover):
+        return self.diff_jpeg(noise_and_cover)
 
 
 def quality_to_factor(quality):
+    """
+    Convert JPEG quality (0-100) to quantization factor.
+    This is used for backward compatibility.
+    """
     if quality < 50:
-        return 50. / quality
+        return 50.0 / quality
     else:
-        return 2. - quality * 0.02
-
-
-def jpeg_compress_decompress(image, downsample_c=False, rounding=diff_round, factor=1.,device=True):
-    image=(image+1)/2
-    image*=255
-    b, c, h, w = image.size()
-
-    orig_height, orig_width = h, w
-    if h % 16 != 0 or w % 16 != 0:
-        # Round up to next multiple of 16
-        h = ((h - 1) // 16 + 1) * 16
-        w = ((w - 1) // 16 + 1) * 16
-
-        vpad = h - orig_height
-        wpad = w - orig_width
-        top = vpad // 2
-        bottom = vpad - top
-        left = wpad // 2
-        right = wpad - left
-
-        # image = tf.pad(image, [[0, 0], [top, bottom], [left, right], [0, 0]], 'SYMMETRIC')
-        image = F.pad(image, [left, right, top, bottom])
-
-    # "Compression"
-    image = rgb_to_ycbcr_jpeg(image)
-    if downsample_c:
-        y, cb, cr = downsampling_420(image)
-    else:
-        y, cb, cr = torch.split(image, 1, dim=1)
-    components = {'y': y, 'cb': cb, 'cr': cr}
-
-    for k in components.keys():
-        comp = components[k]
-        comp = image_to_patches(comp)
-        comp = dct_8x8(comp)
-        comp = c_quantize(comp, rounding, factor) if k in ('cb', 'cr') else y_quantize(comp, rounding, factor)
-        components[k] = comp
-
-    # "Decompression"
-    for k in components.keys():
-        comp = components[k]
-        comp = c_dequantize(comp, factor) if k in ('cb', 'cr') else y_dequantize(comp, factor)
-        comp = idct_8x8(comp)
-        if k in ('cb', 'cr'):
-            if downsample_c:
-                comp = patches_to_image(comp, h // 2, w // 2)
-            else:
-                comp = patches_to_image(comp, h, w)
-        else:
-            comp = patches_to_image(comp, h, w)
-        components[k] = comp
-
-    y, cb, cr = components['y'], components['cb'], components['cr']
-    if downsample_c:
-        image = upsampling_420(y, cb, cr)
-    else:
-        image = torch.stack((y, cb, cr), dim=1)
-    image = ycbcr_to_rgb_jpeg(image)
-
-    # Crop to original size
-    if orig_height != h or orig_width != w:
-        # image = image[:, top:-bottom, left:-right]
-        image = image[:, :, :-vpad, :-wpad]
-
-    # Hack: RGB -> YUV -> RGB sometimes results in incorrect values
-    #    min_value = tf.minimum(tf.reduce_min(image), 0.)
-    #    max_value = tf.maximum(tf.reduce_max(image), 255.)
-    #    value_range = max_value - min_value
-    #    image = 255 * (image - min_value) / value_range
-    image = torch.min(torch.tensor(255.), torch.max(torch.tensor(0.), image))
-    image/=255
-    return image
-class Jpeg(nn.Module):
-    def __init__(self,factor):
-        super(Jpeg, self).__init__()
-        self.factor=factor
-        self.device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-
-    def forward(self, noise_and_cover):
-        encoded_image=noise_and_cover[0]
-        encoded_image=encoded_image.cpu()
-        jpeg_image=jpeg_compress_decompress(encoded_image,factor=quality_to_factor(50))
-        noise_and_cover[0]=torch.FloatTensor(jpeg_image).to(self.device)
-        return noise_and_cover
+        return 2.0 - quality * 0.02
