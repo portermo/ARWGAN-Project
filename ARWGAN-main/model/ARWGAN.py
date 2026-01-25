@@ -33,10 +33,16 @@ class ARWGAN:
         self.ssim_loss = SSIM()
         self.bce_with_logits_loss = nn.BCEWithLogitsLoss().to(device)
         self.mse_loss = nn.MSELoss().to(device)
+        
+        # 損失權重設定 (Phase 4: 衝擊 PSNR 30dB)
+        # Phase 1: mse=0.7, ssim=0.1, decode=1.5 → PSNR ~20dB
+        # Phase 2: mse=1.5, ssim=0.3, decode=1.0 → PSNR ~28dB (最佳)
+        # Phase 3: mse=1.5, ssim=0.3, decode=2.0 → PSNR 下降
+        # Phase 4: mse=2.0, ssim=0.5, decode=1.0 → 目標 PSNR >30dB
         self.adversarial_weight = 0.001
-        self.mse_weight = 0.7
-        self.ssim_weight = 0.1
-        self.decode_weight = 1.5
+        self.mse_weight = 2.0           # 強化: 衝擊 30dB 畫質
+        self.ssim_weight = 0.5          # 強化: 消除雜訊感，提升視覺品質
+        self.decode_weight = 1.0        # 回到甜蜜點: 平衡解碼與畫質
 
         # Defined the labels used for training the discriminator/adversarial loss
         self.cover_label = 1
@@ -59,46 +65,49 @@ class ARWGAN:
 
         self.encoder_decoder.train()
         self.discriminator.train()
+
         with torch.enable_grad():
             # ---------------- Train the discriminator -----------------------------
             self.optimizer_discrim.zero_grad()
-            # train on cover
 
             d_target_label_cover = torch.full((batch_size, 1), self.cover_label, device=self.device)
             d_target_label_encoded = torch.full((batch_size, 1), self.encoded_label, device=self.device)
             g_target_label_encoded = torch.full((batch_size, 1), self.cover_label, device=self.device)
 
             d_on_cover = self.discriminator(images)
-            d_loss_on_cover = self.bce_with_logits_loss(d_on_cover, (d_target_label_cover).float())
+            d_loss_on_cover = self.bce_with_logits_loss(d_on_cover, d_target_label_cover.float())
             d_loss_on_cover.backward()
 
-            # train on fake
             encoded_images, noised_images, decoded_messages = self.encoder_decoder(batch)
             d_on_encoded = self.discriminator(encoded_images.detach())
-            d_loss_on_encoded = self.bce_with_logits_loss(d_on_encoded, (d_target_label_encoded).float())
-
+            d_loss_on_encoded = self.bce_with_logits_loss(d_on_encoded, d_target_label_encoded.float())
             d_loss_on_encoded.backward()
             self.optimizer_discrim.step()
 
-            # --------------Train the generator (encoder-decoder) ---------------------
+            # -------------- Train the generator (encoder-decoder) ---------------------
             self.optimizer_enc_dec.zero_grad()
             d_on_encoded_for_enc = self.discriminator(encoded_images)
             g_loss_adv = self.bce_with_logits_loss(d_on_encoded_for_enc.float(), g_target_label_encoded.float())
 
-            if self.vgg_loss == None:
-                g_loss_enc = self.mse_loss(encoded_images, images)
+            # 純 Pixel MSE（用於 log 觀察；VGG 時 PSNR 也應基於 pixel）
+            mse_pixel_loss = self.mse_loss(encoded_images, images)
 
+            if self.vgg_loss is None:
+                g_loss_enc = mse_pixel_loss
             else:
                 vgg_on_cov = self.vgg_loss(images)
                 vgg_on_enc = self.vgg_loss(encoded_images)
                 g_loss_enc = self.mse_loss(vgg_on_cov, vgg_on_enc)
+
             g_loss_enc_ssim = self.ssim_loss(encoded_images, images)
             g_loss_dec = self.mse_loss(decoded_messages, messages)
-            g_loss = self.adversarial_weight * g_loss_adv + self.ssim_weight * (
-                        1 - g_loss_enc_ssim) + self.mse_weight * (g_loss_enc) + self.decode_weight * (g_loss_dec)
-
+            g_loss = (
+                self.adversarial_weight * g_loss_adv
+                + self.ssim_weight * (1 - g_loss_enc_ssim)
+                + self.mse_weight * g_loss_enc
+                + self.decode_weight * g_loss_dec
+            )
             g_loss.backward()
-
             self.optimizer_enc_dec.step()
 
         decoded_rounded = decoded_messages.detach().cpu().numpy().round().clip(0, 1)
@@ -126,8 +135,8 @@ class ARWGAN:
 
         self.encoder_decoder.eval()
         self.discriminator.eval()
-        with torch.no_grad():
 
+        with torch.no_grad():
             d_target_label_cover = torch.full((batch_size, 1), self.cover_label, device=self.device)
             d_target_label_encoded = torch.full((batch_size, 1), self.encoded_label, device=self.device)
             g_target_label_encoded = torch.full((batch_size, 1), self.cover_label, device=self.device)
@@ -143,18 +152,30 @@ class ARWGAN:
             d_on_encoded_for_enc = self.discriminator(encoded_images)
             g_loss_adv = self.bce_with_logits_loss(d_on_encoded_for_enc.float(), g_target_label_encoded.float())
             g_loss_enc_ssim = self.ssim_loss(images, encoded_images)
+
+            # 強制用 Pixel MSE 算 PSNR（圖在 [-1,1]，MAX^2=4）
+            mse_pixel_loss = self.mse_loss(encoded_images, images)
             if self.vgg_loss is None:
-                g_loss_enc = self.mse_loss(encoded_images, images)
+                g_loss_enc = mse_pixel_loss
             else:
                 vgg_on_cov = self.vgg_loss(images)
                 vgg_on_enc = self.vgg_loss(encoded_images)
                 g_loss_enc = self.mse_loss(vgg_on_cov, vgg_on_enc)
+
             g_loss_dec = self.mse_loss(decoded_messages, messages)
-            g_loss = self.adversarial_weight * g_loss_adv + self.ssim_weight * (
-                        1 - g_loss_enc_ssim) + self.mse_weight * (g_loss_enc) + self.decode_weight * (g_loss_dec)
+            g_loss = (
+                self.adversarial_weight * g_loss_adv
+                + self.ssim_weight * (1 - g_loss_enc_ssim)
+                + self.mse_weight * g_loss_enc
+                + self.decode_weight * g_loss_dec
+            )
+
         decoded_rounded = decoded_messages.detach().cpu().numpy().round().clip(0, 1)
         bitwise_avg_err = np.sum(np.abs(decoded_rounded - messages.detach().cpu().numpy())) / (
                 batch_size * messages.shape[1])
+
+        # PSNR = 10*log10(MAX^2/MSE)，圖 [-1,1] 故 MAX^2=4
+        psnr = 10 * torch.log10(4.0 / mse_pixel_loss.clamp(min=1e-8)).item()
 
         losses = {
             'loss           ': g_loss.item(),
@@ -165,8 +186,8 @@ class ARWGAN:
             'discr_cover_bce': d_loss_on_cover.item(),
             'discr_encod_bce': d_loss_on_encoded.item(),
             'encoded_ssim   ': g_loss_enc_ssim.item(),
-            'PSNR           ': 10 * torch.log10(4 / g_loss_enc).item(),
-            'ssim           ': 1 - g_loss_enc_ssim
+            'PSNR           ': psnr,
+            'ssim           ': (1 - g_loss_enc_ssim).item(),
         }
         return losses, (encoded_images, noised_images, decoded_messages)
 

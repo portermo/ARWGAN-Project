@@ -276,16 +276,32 @@ class DiffJPEG(nn.Module):
 class Jpeg(nn.Module):
     """
     Wrapper class for DiffJPEG to match the original interface.
-    Accepts factor parameter (quantization scale).
+    
+    自動判斷輸入是 JPEG Quality 還是 Quantization Factor：
+    - 數值 > 10：視為 JPEG Quality (如 50, 80)，自動轉換為 factor
+    - 數值 <= 10：視為 Quantization Factor (如 1.0, 2.0)，直接使用
     """
     
-    def __init__(self, factor):
+    def __init__(self, quality_or_factor):
         super(Jpeg, self).__init__()
-        # Convert factor to float if it's a string
-        if isinstance(factor, str):
-            factor = float(factor)
-        self.diff_jpeg = DiffJPEG(factor=factor)
-        self.factor = factor
+        
+        # Convert to float if it's a string
+        if isinstance(quality_or_factor, str):
+            quality_or_factor = float(quality_or_factor)
+        
+        # 自動判斷：數值 > 10 視為 Quality，否則視為 Factor
+        if quality_or_factor > 10:
+            # 視為 JPEG Quality (0-100)
+            self.quality = quality_or_factor
+            self.factor = quality_to_factor(quality_or_factor)
+            print(f"[Jpeg] 初始化模式: JPEG Quality = {self.quality} → Factor = {self.factor:.4f}")
+        else:
+            # 視為 Quantization Factor
+            self.quality = None
+            self.factor = quality_or_factor
+            print(f"[Jpeg] 初始化模式: Quantization Factor = {self.factor}")
+        
+        self.diff_jpeg = DiffJPEG(factor=self.factor)
     
     def forward(self, noise_and_cover):
         return self.diff_jpeg(noise_and_cover)
