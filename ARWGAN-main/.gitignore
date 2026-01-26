@@ -170,3 +170,15 @@ data/
 *_check_report.txt
 test_quality_check.png
 requirements_backup_*.txt
+
+# Training outputs and checkpoints (too large for git)
+runs/
+*.pyt
+
+# Test results and images (generated files)
+test_results/
+test_results_epoch90_paper/
+test_images_uscsipi/
+
+# Large visualization outputs (keep only important ones)
+# attention_viz_epoch90.png  # Keep this one as it's important
