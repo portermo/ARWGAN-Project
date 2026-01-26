@@ -164,3 +164,9 @@ venv/
 
 # Data directory
 data/
+
+# Temporary reports and test outputs
+*_report.txt
+*_check_report.txt
+test_quality_check.png
+requirements_backup_*.txt

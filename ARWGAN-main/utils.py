@@ -138,12 +138,26 @@ def get_data_loaders(network_config: HiDDenConfiguration, train_options: Trainin
     }
 
     train_images = datasets.ImageFolder(train_options.train_folder, data_transforms['train'])
-    train_loader = torch.utils.data.DataLoader(train_images, batch_size=train_options.batch_size, shuffle=True,
-                                               num_workers=4)
+    train_loader = torch.utils.data.DataLoader(
+        train_images, 
+        batch_size=train_options.batch_size, 
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,  # 保持 worker 進程存活，避免重複創建
+        prefetch_factor=2  # 預取數量
+    )
 
     validation_images = datasets.ImageFolder(train_options.validation_folder, data_transforms['test'])
-    validation_loader = torch.utils.data.DataLoader(validation_images, batch_size=train_options.batch_size,
-                                                    shuffle=False, num_workers=4)
+    validation_loader = torch.utils.data.DataLoader(
+        validation_images, 
+        batch_size=train_options.batch_size,
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2
+    )
 
     return train_loader, validation_loader
 
