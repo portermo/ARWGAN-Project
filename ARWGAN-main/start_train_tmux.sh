@@ -1,7 +1,7 @@
 #!/bin/bash
 # ARWGAN 訓練 tmux 會話啟動腳本
 
-cd /mnt/nvme/Project/arwgan/ARWGAN-Project/ARWGAN-main
+cd /mnt/nvme/p3/Project/arwgan/ARWGAN-Project/ARWGAN-main
 
 # 檢查是否已經存在 train 會話
 if tmux has-session -t train 2>/dev/null; then

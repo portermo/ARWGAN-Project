@@ -1,7 +1,7 @@
 #!/bin/bash
 # 快速檢查資料集的腳本
 
-cd /mnt/nvme/Project/arwgan/ARWGAN-Project/ARWGAN-main
+cd /mnt/nvme/p3/Project/arwgan/ARWGAN-Project/ARWGAN-main
 source venv/bin/activate
 
 echo "開始檢查資料集..."

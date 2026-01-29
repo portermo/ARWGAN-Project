@@ -108,7 +108,7 @@ prefix }  # 與下一個交換
 ### 在專案目錄啟動 tmux 並激活虛擬環境
 ```bash
 # 創建一個啟動腳本
-cd /mnt/nvme/Project/arwgan/ARWGAN-Project/ARWGAN-main
+cd /mnt/nvme/p3/Project/arwgan/ARWGAN-Project/ARWGAN-main
 tmux new -s arwgan -c "$(pwd)" \; \
   send-keys "source venv/bin/activate" C-m \; \
   split-window -h -c "$(pwd)" \; \
@@ -119,7 +119,7 @@ tmux new -s arwgan -c "$(pwd)" \; \
 創建 `start_tmux.sh`：
 ```bash
 #!/bin/bash
-cd /mnt/nvme/Project/arwgan/ARWGAN-Project/ARWGAN-main
+cd /mnt/nvme/p3/Project/arwgan/ARWGAN-Project/ARWGAN-main
 tmux new-session -d -s arwgan -c "$(pwd)"
 tmux send-keys -t arwgan "source venv/bin/activate" C-m
 tmux split-window -h -t arwgan -c "$(pwd)"
@@ -182,7 +182,7 @@ setw -g pane-base-index 1
 
 ### 啟動訓練會話
 ```bash
-cd /mnt/nvme/Project/arwgan/ARWGAN-Project/ARWGAN-main
+cd /mnt/nvme/p3/Project/arwgan/ARWGAN-Project/ARWGAN-main
 tmux new -s train -c "$(pwd)"
 # 在 tmux 中：
 source venv/bin/activate

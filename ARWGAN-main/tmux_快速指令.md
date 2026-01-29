@@ -14,7 +14,7 @@ tmux a -t 0
 
 ### 創建新的 "train" 會話
 ```bash
-cd /mnt/nvme/Project/arwgan/ARWGAN-Project/ARWGAN-main
+cd /mnt/nvme/p3/Project/arwgan/ARWGAN-Project/ARWGAN-main
 tmux new -s train
 # 然後在會話中：
 source venv/bin/activate

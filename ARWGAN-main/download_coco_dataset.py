@@ -15,18 +15,110 @@ from pathlib import Path
 import zipfile
 from PIL import Image
 import argparse
+import time
+import json
+from urllib3.exceptions import ReadTimeoutError
+from requests.exceptions import ConnectionError, Timeout, ReadTimeout
+
+# #region agent log
+LOG_PATH = "/mnt/nvme/p3/Project/arwgan/ARWGAN-Project/.cursor/debug.log"
+# #endregion
 
 
-def download_coco_dataset():
-    """下載 COCO 2017 資料集"""
+def log_debug(session_id, run_id, hypothesis_id, location, message, data):
+    """記錄調試日誌"""
+    # #region agent log
+    try:
+        log_entry = {
+            "sessionId": session_id,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000)
+        }
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
+
+def download_coco_dataset(max_retries=5, retry_delay=30):
+    """下載 COCO 2017 資料集（帶重試機制）"""
+    # #region agent log
+    log_debug("debug-session", "run1", "A", "download_coco_dataset:20", "函數開始", {"max_retries": max_retries, "retry_delay": retry_delay})
+    # #endregion
+    
     print("正在下載 COCO 2017 資料集...")
     print("這可能需要一些時間，請耐心等待...")
     
-    # Download latest version
-    path = kagglehub.dataset_download("awsaf49/coco-2017-dataset")
+    dataset_name = "awsaf49/coco-2017-dataset"
+    last_error = None
     
-    print(f"資料集下載完成，路徑: {path}")
-    return path
+    for attempt in range(1, max_retries + 1):
+        # #region agent log
+        log_debug("debug-session", "run1", "A", f"download_coco_dataset:26", "重試嘗試", {"attempt": attempt, "max_retries": max_retries})
+        # #endregion
+        
+        try:
+            if attempt > 1:
+                print(f"\n重試下載 (嘗試 {attempt}/{max_retries})...")
+                print(f"等待 {retry_delay} 秒後重試...")
+                time.sleep(retry_delay)
+            
+            # #region agent log
+            log_debug("debug-session", "run1", "A", f"download_coco_dataset:33", "調用 kagglehub.dataset_download", {"dataset_name": dataset_name, "attempt": attempt})
+            # #endregion
+            
+            # Download latest version
+            path = kagglehub.dataset_download(dataset_name)
+            
+            # #region agent log
+            log_debug("debug-session", "run1", "A", f"download_coco_dataset:38", "下載成功", {"path": str(path), "attempt": attempt})
+            # #endregion
+            
+            print(f"資料集下載完成，路徑: {path}")
+            return path
+            
+        except (ReadTimeoutError, ConnectionError, Timeout, ReadTimeout) as e:
+            # #region agent log
+            log_debug("debug-session", "run1", "B", f"download_coco_dataset:45", "捕獲超時/連接錯誤", {"error_type": type(e).__name__, "error_msg": str(e), "attempt": attempt})
+            # #endregion
+            
+            last_error = e
+            error_type = type(e).__name__
+            print(f"\n⚠️  下載過程中發生 {error_type} 錯誤 (嘗試 {attempt}/{max_retries})")
+            print(f"錯誤訊息: {str(e)}")
+            
+            if attempt < max_retries:
+                print(f"將在 {retry_delay} 秒後自動重試...")
+                # kagglehub 支援斷點續傳，會自動從上次中斷的地方繼續
+            else:
+                print(f"\n❌ 已達到最大重試次數 ({max_retries})，下載失敗")
+                raise
+        
+        except Exception as e:
+            # #region agent log
+            log_debug("debug-session", "run1", "C", f"download_coco_dataset:58", "捕獲其他錯誤", {"error_type": type(e).__name__, "error_msg": str(e), "attempt": attempt})
+            # #endregion
+            
+            last_error = e
+            error_type = type(e).__name__
+            print(f"\n⚠️  下載過程中發生未預期的錯誤: {error_type}")
+            print(f"錯誤訊息: {str(e)}")
+            
+            # 對於非超時錯誤，也進行重試
+            if attempt < max_retries:
+                print(f"將在 {retry_delay} 秒後自動重試...")
+            else:
+                print(f"\n❌ 已達到最大重試次數 ({max_retries})，下載失敗")
+                raise
+    
+    # 如果所有重試都失敗
+    if last_error:
+        raise last_error
 
 
 def extract_if_needed(dataset_path, extract_to=None):
