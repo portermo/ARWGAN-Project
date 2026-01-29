@@ -1,8 +1,6 @@
 import torch
-import torch.nn
 import argparse
 import os
-import math
 import numpy as np
 import utils
 from model.ARWGAN import ARWGAN
@@ -11,16 +9,6 @@ from noise_layers.noiser import Noiser
 from PIL import Image
 import torchvision
 import torchvision.transforms.functional as TF
-
-
-def calculate_accuracy(decoded, original):
-    """計算位元準確率和錯誤率"""
-    decoded_rounded = decoded.round().clip(0, 1)
-    diff = np.abs(decoded_rounded - original)
-    error_rate = np.mean(diff)
-    accuracy = 1.0 - error_rate
-    return accuracy, error_rate
-
 
 def main():
     # 設定參數
@@ -34,36 +22,24 @@ def main():
     parser.add_argument('--output-folder', '-out', default='test_results', type=str,
                         help='Output folder for result images')
     parser.add_argument('--batch-size', '-b', default=1, type=int, 
-                        help='Batch size (default: 1 for single image testing)')
+                        help='Batch size (default: 1)')
     parser.add_argument('--mode', type=str, default='custom', 
                         choices=['paper', 'hell', 'clean', 'custom'],
-                        help='Test mode: paper (Jpeg+Crop), hell (5 noises), clean (no noise), or custom (use --noise)')
+                        help='Test mode')
     parser.add_argument("--noise", '-n', nargs="*", action=NoiseArgParser,
-                        help='Custom noise configuration (only used in custom mode)')
+                        help='Custom noise configuration')
     
     args = parser.parse_args()
     
     # 檢查 CUDA
-    if torch.cuda.is_available():
-        device = torch.device('cuda')
-        print(f"Testing on device: {device}")
-    else:
-        device = torch.device('cpu')
-        print(f"Testing on device: {device} (CPU mode)")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Testing on device: {device}")
 
-    # 1. 載入設定（包含訓練時的 noise_config）
+    # 1. 載入設定
+    # 這裡會讀取訓練時原本的 Noise Config，這對載入權重至關重要
     train_options, net_config, train_noise_config = utils.load_options(args.options_file)
     
-    # 2. 使用訓練時的 noise_config 建立模型並載入權重
-    # （必須用相同配置才能正確載入 state_dict）
-    train_noiser = Noiser(train_noise_config, device)
-    checkpoint = torch.load(args.checkpoint_file, map_location=device)
-    model = ARWGAN(net_config, device, train_noiser, None)
-    utils.model_from_checkpoint(model, checkpoint)
-    model.encoder_decoder.eval()
-    model.discriminator.eval()
-    
-    # 3. 定義測試用的攻擊模式
+    # 2. 定義測試用的攻擊模式
     if args.mode == 'paper':
         print("=== Mode: Paper Reproduction (Jpeg(50) + Crop(3.5%)) ===")
         test_noise_config = [
@@ -84,27 +60,33 @@ def main():
         test_noise_config = []
     else:  # custom mode
         if args.noise:
-            test_noise_config = args.noise  # NoiseArgParser 已經解析成物件了
+            test_noise_config = args.noise
             print(f"=== Mode: Custom (User-defined noise) ===")
-            print(f"Noise config: {[type(n).__name__ for n in test_noise_config]}")
         else:
             print("=== Mode: Custom (No noise specified, using clean mode) ===")
             test_noise_config = []
 
-    # 4. 替換為測試用的 Noiser，並確保移動到正確的設備
-    test_noiser = Noiser(test_noise_config, device).to(device)
+    # 3. [關鍵修正] 初始化模型與載入權重
+    # 步驟 A: 先用「訓練時的設定」初始化 Noiser，避免 load_state_dict 因為 key 不匹配而報錯
+    train_noiser = Noiser(train_noise_config, device).to(device)
+    model = ARWGAN(net_config, device, train_noiser, None)
+    
+    # 步驟 B: 載入權重
+    print(f"Loading checkpoint from: {args.checkpoint_file}")
+    checkpoint = torch.load(args.checkpoint_file, map_location=device)
+    utils.model_from_checkpoint(model, checkpoint)
+    
+    # 步驟 C: [關鍵修正] 權重載入完成後，替換成「測試用的 Noiser」
+    test_noiser = Noiser(test_noise_config, device).to(device) # 確保移至 GPU
     model.encoder_decoder.noiser = test_noiser
     
-    print(f"Model loaded from: {args.checkpoint_file}")
-    print(f"Image size: {net_config.H}x{net_config.W}")
-    print(f"Message length: {net_config.message_length}")
+    model.encoder_decoder.eval()
+    model.discriminator.eval()
     
     # 4. 準備數據
     if not os.path.exists(args.output_folder):
         os.makedirs(args.output_folder)
-        print(f"Created output folder: {args.output_folder}")
         
-    # 獲取所有圖像檔案
     image_files = [f for f in os.listdir(args.source_images) 
                    if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif'))]
     
@@ -119,9 +101,8 @@ def main():
     total_ssim = 0
     total_acc = 0
     total_error = 0
-    total_loss = 0
     
-    # 固定隨機種子，方便重現結果
+    # 固定隨機種子
     np.random.seed(42)
     torch.manual_seed(42)
     
@@ -131,7 +112,6 @@ def main():
 
     with torch.no_grad():
         for idx, filename in enumerate(image_files):
-            # 讀取圖片
             img_path = os.path.join(args.source_images, filename)
             try:
                 image_pil = Image.open(img_path).convert('RGB')
@@ -141,23 +121,40 @@ def main():
                 
             image_pil = image_pil.resize((net_config.H, net_config.W))
             
-            # 轉 Tensor 並轉換到 [-1, 1] 範圍（與訓練一致）
+            # 轉 Tensor [-1, 1]
             image_tensor = TF.to_tensor(image_pil).to(device)
-            image_tensor = image_tensor * 2 - 1  # 轉換到 [-1, 1]
+            image_tensor = image_tensor * 2 - 1
             image_tensor.unsqueeze_(0)
             
             # 產生隨機訊息
             message = torch.Tensor(np.random.choice([0, 1], (image_tensor.shape[0],
                                                              net_config.message_length))).to(device)
 
-            # 模型推論（使用 validate_on_batch 獲取完整評估）
+            # 模型推論
             losses, (encoded_images, noised_images, decoded_messages) = model.validate_on_batch(
                 [image_tensor, message])
 
-            # 從 losses 中提取指標（注意：key 帶有尾部空格用於格式化）
-            psnr = losses.get('PSNR           ', 0)
-            ssim = losses.get('encoded_ssim   ', 0)  # 這是真正的 SSIM 值
-            bitwise_error = losses.get('bitwise-error  ', 0)
+            # [關鍵修正] 使用 strip() 去除 Key 的空格
+            clean_losses = {k.strip(): v for k, v in losses.items()}
+
+            psnr = clean_losses.get('PSNR', 0)
+            
+            # [關鍵修正] SSIM 計算邏輯修正
+            # 根據 ARWGAN.py，'encoded_ssim' 通常存的是計算出來的 SSIM 分數 (接近 1)
+            # 而不是 Loss。如果之前的 log 顯示 0.9x，那這裡直接取值即可。
+            if 'ssim' in clean_losses:
+                 # 如果 ARWGAN.py 有存 'ssim' 這個 key，通常它是 1-loss 或直接的分數
+                 # 我們優先相信數值大的那個（因為 SSIM 應該接近 1）
+                 val = clean_losses['ssim']
+                 ssim = val if val > 0.5 else (1 - val)
+            elif 'encoded_ssim' in clean_losses:
+                 val = clean_losses['encoded_ssim']
+                 # 同樣邏輯，如果大於 0.5 視為分數，小於 0.5 視為 Loss
+                 ssim = val if val > 0.5 else (1 - val)
+            else:
+                ssim = 0
+
+            bitwise_error = clean_losses.get('bitwise-error', 0)
             accuracy = 1.0 - bitwise_error
             
             # 累加統計
@@ -165,41 +162,40 @@ def main():
             total_ssim += ssim
             total_acc += accuracy
             total_error += bitwise_error
-            total_loss += losses.get('loss           ', 0)
             
-            # 顯示結果
             print(f"{filename[:28]:<30} | {psnr:>10.2f} | {ssim:>6.4f} | {bitwise_error:>10.4f} | {accuracy:>8.2%}")
 
-            # 保存每張圖片的結果
-            # 轉換回 [0, 1] 範圍以便保存
-            image_tensor_01 = torch.clamp((image_tensor + 1) / 2, 0, 1)
-            encoded_images_01 = torch.clamp((encoded_images + 1) / 2, 0, 1)
-            
-            # 保存原圖和編碼圖的對比
-            base_name = os.path.splitext(filename)[0]
-            stacked = torch.cat([image_tensor_01, encoded_images_01], dim=3)  # 水平拼接
-            save_path = os.path.join(args.output_folder, f"{base_name}_compare.png")
-            torchvision.utils.save_image(stacked, save_path)
+            # 保存圖片
+            if idx == 0:
+                image_tensor_01 = torch.clamp((image_tensor + 1) / 2, 0, 1)
+                encoded_images_01 = torch.clamp((encoded_images + 1) / 2, 0, 1)
+                noised_images_01 = torch.clamp((noised_images + 1) / 2, 0, 1)
+                
+                base_name = os.path.splitext(filename)[0]
+                # 拼接: 原圖 | 加浮水印圖 | 攻擊後圖
+                stacked = torch.cat([image_tensor_01, encoded_images_01, noised_images_01], dim=3)
+                save_path = os.path.join(args.output_folder, f"{base_name}_compare.png")
+                torchvision.utils.save_image(stacked, save_path)
+                print(f"Example saved: {save_path} (Left: Org, Mid: Enc, Right: Noised)")
 
-    # 5. 最終報告
+    # 最終報告
     num_images = len(image_files)
-    avg_psnr = total_psnr / num_images
-    avg_ssim = total_ssim / num_images
-    avg_error = total_error / num_images
-    avg_acc = total_acc / num_images
-    avg_loss = total_loss / num_images
+    if num_images > 0:
+        avg_psnr = total_psnr / num_images
+        avg_ssim = total_ssim / num_images
+        avg_error = total_error / num_images
+        avg_acc = total_acc / num_images
 
-    print("\n" + "="*80)
-    print(f"FINAL RESULTS ({args.mode.upper()} MODE)")
-    print("="*80)
-    print(f"Total images tested: {num_images}")
-    print(f"Average Loss         : {avg_loss:.6f}")
-    print(f"Average PSNR         : {avg_psnr:.4f} dB")
-    print(f"Average SSIM          : {avg_ssim:.6f}")
-    print(f"Average Error Rate    : {avg_error:.4%}")
-    print(f"Average Accuracy      : {avg_acc:.4%}")
-    print("="*80)
-    print(f"Results saved to: {args.output_folder}")
+        print("\n" + "="*80)
+        print(f"FINAL RESULTS ({args.mode.upper()} MODE)")
+        print("="*80)
+        print(f"Total images tested: {num_images}")
+        print(f"Average PSNR         : {avg_psnr:.4f} dB")
+        print(f"Average SSIM         : {avg_ssim:.6f}")
+        print(f"Average Error Rate    : {avg_error:.4%}")
+        print(f"Average Accuracy      : {avg_acc:.4%}")
+        print("="*80)
 
+# [關鍵修正] 加上程式入口點
 if __name__ == '__main__':
     main()

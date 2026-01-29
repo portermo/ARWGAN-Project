@@ -159,6 +159,13 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# IDE and editor files
+.vscode/
+.cursor/
+*.swp
+*.swo
+*~
+
 # Virtual environment
 venv/
 
@@ -174,6 +181,9 @@ requirements_backup_*.txt
 # Training outputs and checkpoints (too large for git)
 runs/
 *.pyt
+checkpoints_improved/*.pth
+checkpoints_improved/*.csv
+*.pth
 
 # Test results and images (generated files)
 test_results/
