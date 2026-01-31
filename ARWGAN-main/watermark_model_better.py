@@ -97,8 +97,25 @@ class Encoder(nn.Module):
         # Watermark embedding
         self.wm_embed = nn.Conv2d(watermark_bits, 64, kernel_size=1)  # Embed watermark channels
         
-        # 修復：加入輸出層，將 64 channels 映射到 3 channels
-        self.to_rgb = nn.Conv2d(64, 3, kernel_size=1)
+        # ============================================================
+        # 修復：特徵尺度正規化（解決 attended/wm_embedded 尺度不匹配問題）
+        # ============================================================
+        # 診斷發現：CBAM 後 attended mean=0.026，wm_embedded mean=0.127
+        # 比例差 14 倍，導致 Concat 後 Decoder 無法學習
+        # 解法：對兩個特徵分別做 BatchNorm，統一到相同尺度
+        self.bn_attended = nn.BatchNorm2d(64)
+        self.bn_wm = nn.BatchNorm2d(64)
+        
+        # 修復：融合改為拼接，輸出 128 channels→3；獨立保留浮水印特徵
+        self.to_rgb = nn.Conv2d(128, 3, kernel_size=1)
+        # ============================================================
+        # 小隨機初始化（不能用零初始化，否則梯度斷裂）
+        # ============================================================
+        # 使用小的隨機值初始化，而非零初始化
+        # 零初始化會導致: residual=0 → 梯度無法回傳 → 模型不學習
+        nn.init.normal_(self.to_rgb.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.to_rgb.bias)  # bias 可以是 0
+        self.residual_scale = 0.1  # 水印以小擾動形式疊加
         
     def forward(self, image, watermark):
         # image: (B,3,H,W), watermark: (B, bits) binary tensor
@@ -121,11 +138,16 @@ class Encoder(nn.Module):
         wm_repeated = watermark.unsqueeze(2).unsqueeze(3).repeat(1,1,H,W)  # (B,bits,H,W)
         wm_embedded = self.wm_embed(wm_repeated.float())  # (B,64,H,W)
         
-        # Fuse with attended features (point-wise multiply + add)
-        fused = attended * wm_embedded + attended
+        # ============================================================
+        # 特徵尺度正規化：確保兩個特徵在 Concat 前處於相同尺度
+        # ============================================================
+        attended_norm = self.bn_attended(attended)
+        wm_embedded_norm = self.bn_wm(wm_embedded)
         
-        # 修復：使用 1x1 conv 映射到 RGB，保留更多資訊
-        residual = self.to_rgb(fused)
+        # 融合改為拼接，確保浮水印特徵獨立保留、不被影像特徵淹沒
+        fused = torch.cat([attended_norm, wm_embedded_norm], dim=1)  # (B,128,H,W)
+        
+        residual = self.to_rgb(fused) * self.residual_scale
         watermarked = image + residual
         return torch.clamp(watermarked, 0, 1)
 
@@ -191,6 +213,10 @@ class NoiseLayer(nn.Module):
         self.device = device
         # 修復：使用可微分 JPEG
         self.diff_jpeg = DiffJPEG(device)
+        # Warm-up 機制：前 warmup_epochs 個 epochs 關閉攻擊
+        self.warmup_epochs = 10
+        self.current_epoch = 0
+        self.enable_attacks = False
 
     def gaussian_noise(self, x, std=0.05):
         noise = torch.randn_like(x) * std
@@ -226,7 +252,18 @@ class NoiseLayer(nn.Module):
         return F.interpolate(F.interpolate(x, scale_factor=scale, mode='bicubic', align_corners=False), 
                            size=x.shape[2:], mode='bicubic', align_corners=False)
 
+    def set_epoch(self, epoch):
+        """設置當前 epoch，用於 Warm-up 機制"""
+        self.current_epoch = epoch
+        # 前 warmup_epochs 個 epochs 關閉攻擊
+        self.enable_attacks = (epoch >= self.warmup_epochs)
+    
     def forward(self, x, original_image=None):
+        # Warm-up 機制：前 warmup_epochs 個 epochs 直接返回原始輸入
+        if not self.enable_attacks:
+            return x
+        
+        # 10 個 epochs 之後，逐漸開啟攻擊
         attack = random.choice(self.attacks)
         if attack == 'gaussian':
             return self.gaussian_noise(x)
@@ -240,44 +277,82 @@ class NoiseLayer(nn.Module):
             return self.resize(x)
         return x  # No attack or fallback
 
-# Decoder (改進為U-Net like with skip connections)
+# ============================================================
+# Decoder (CNN 分類器架構 - 適合 Image → Bits 任務)
+# ============================================================
+# 設計理念：
+#   - 移除 U-Net 的 Skip Connections 和 Upsampling
+#   - 使用純粹的下採樣 CNN，類似圖像分類器
+#   - 256x256 → 128 → 64 → 32 → 16 → 8 → GlobalPool → 64 bits
+#   - 這樣可以過濾掉圖像背景雜訊，專注於提取浮水印訊號
+# ============================================================
 class Decoder(nn.Module):
     def __init__(self, watermark_bits=64):
         super(Decoder, self).__init__()
         self.watermark_bits = watermark_bits
-        # Feature extraction
-        self.conv1 = nn.Conv2d(3, 64, 3, padding=1)
-        self.conv2 = nn.Conv2d(64, 128, 3, padding=1, stride=2)
-        self.conv3 = nn.Conv2d(128, 256, 3, padding=1, stride=2)
-        self.up1 = nn.ConvTranspose2d(256, 128, 2, stride=2)
-        self.conv4 = nn.Conv2d(256, 128, 3, padding=1)  # Skip from conv2
-        self.up2 = nn.ConvTranspose2d(128, 64, 2, stride=2)
-        self.conv5 = nn.Conv2d(128, 64, 3, padding=1)  # Skip from conv1
         
-        # Reduce to watermark channels
-        self.reduce = nn.Conv2d(64, watermark_bits, 1)
+        # 連續下採樣 CNN（類似分類器/Discriminator）
+        # 輸入: 3x256x256
+        self.features = nn.Sequential(
+            # Block 1: 3 -> 64, 256x256 -> 256x256
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Block 2: 64 -> 64, 256x256 -> 128x128
+            nn.Conv2d(64, 64, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Block 3: 64 -> 128, 128x128 -> 64x64
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Block 4: 128 -> 256, 64x64 -> 32x32
+            nn.Conv2d(128, 256, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Block 5: 256 -> 512, 32x32 -> 16x16
+            nn.Conv2d(256, 512, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Block 6: 512 -> 512, 16x16 -> 8x8
+            nn.Conv2d(512, 512, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        
+        # Global Average Pooling: 8x8 -> 1x1
         self.global_pool = nn.AdaptiveAvgPool2d(1)
+        
+        # 全連接層輸出 watermark bits
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, watermark_bits),
+        )
+        
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # Encoder part
-        c1 = F.relu(self.conv1(x))
-        c2 = F.relu(self.conv2(c1))
-        c3 = F.relu(self.conv3(c2))
+        # 特徵提取（連續下採樣）
+        features = self.features(x)  # (B, 512, 8, 8)
         
-        # Decoder with skips
-        u1 = self.up1(c3)
-        u1 = torch.cat([u1, c2], dim=1)
-        u1 = F.relu(self.conv4(u1))
-        u2 = self.up2(u1)
-        u2 = torch.cat([u2, c1], dim=1)
-        u2 = F.relu(self.conv5(u2))
+        # Global Average Pooling
+        pooled = self.global_pool(features)  # (B, 512, 1, 1)
+        pooled = pooled.view(pooled.size(0), -1)  # (B, 512)
         
-        # Extract watermark
-        reduced = self.reduce(u2)
-        pooled = self.global_pool(reduced).squeeze(-1).squeeze(-1)  # (B, bits)
-        extracted = (self.sigmoid(pooled) > 0.5).float()  # Binary decision
-        return extracted, pooled  # Return binary and logits for loss
+        # 分類器輸出 logits
+        logits = self.classifier(pooled)  # (B, watermark_bits)
+        
+        # 二值化決策
+        extracted = (self.sigmoid(logits) > 0.5).float()
+        
+        return extracted, logits  # 保持介面不變
 
 # Discriminator (PatchGAN for WGAN-GP)
 class Discriminator(nn.Module):
@@ -298,16 +373,24 @@ class Discriminator(nn.Module):
 
 # VGG 感知損失（新增）
 class VGGLoss(nn.Module):
+    # ImageNet 標準化（VGG 預訓練權重以此為準）
+    IMAGENET_MEAN = [0.485, 0.456, 0.406]
+    IMAGENET_STD = [0.229, 0.224, 0.225]
+
     def __init__(self):
         super(VGGLoss, self).__init__()
-        vgg16 = torchvision.models.vgg16(pretrained=True)
+        vgg16 = torchvision.models.vgg16(weights=torchvision.models.VGG16_Weights.IMAGENET1K_V1)
         # 使用 VGG16 的前 3 個 block
         self.vgg_layers = nn.Sequential(*list(vgg16.features.children())[:16])
         for param in self.vgg_layers.parameters():
             param.requires_grad = False
-        
+
     def forward(self, x):
-        return self.vgg_layers(x)
+        # x: (B,3,H,W), 通常 [0,1]；VGG 需 ImageNet 標準化
+        mean = torch.tensor(self.IMAGENET_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        std = torch.tensor(self.IMAGENET_STD, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        x_norm = (x - mean) / std
+        return self.vgg_layers(x_norm)
 
 # SSIM Loss (for image quality)
 def ssim_loss(img1, img2):
@@ -349,12 +432,14 @@ def write_losses_to_csv(file_name, losses_dict, epoch, duration):
         row_to_write = [epoch] + ['{:.4f}'.format(v) for v in losses_dict.values()] + ['{:.0f}'.format(duration)]
         writer.writerow(row_to_write)
 
-# Dataset (COCO example)
+# Dataset (COCO example) — 固定輸出尺寸，避免 DataLoader collate 時尺寸不一致
+TARGET_IMAGE_SIZE = (256, 256)
+
 class WatermarkDataset(Dataset):
     def __init__(self, root_dir='./data/coco/images/train2017', transform=None, watermark_bits=64):
         self.root_dir = root_dir
         self.transform = transform or transforms.Compose([
-            transforms.Resize((256, 256)),
+            transforms.Resize(TARGET_IMAGE_SIZE),
             transforms.ToTensor(),
         ])
         
@@ -370,17 +455,13 @@ class WatermarkDataset(Dataset):
         self.image_list = []
         
         # 方法1: 直接在指定目錄中查找
+        # 簡化邏輯：不使用 os.path.islink/realpath，避免多進程問題
         try:
             all_files = [f for f in os.listdir(root_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
             for f in all_files:
                 img_path = os.path.join(root_dir, f)
-                if os.path.exists(img_path) and (os.path.isfile(img_path) or os.path.islink(img_path)):
-                    # 對於符號連結，檢查目標是否存在
-                    if os.path.islink(img_path):
-                        if os.path.exists(os.path.realpath(img_path)):
-                            self.image_list.append(f)
-                    else:
-                        self.image_list.append(f)
+                if os.path.exists(img_path):
+                    self.image_list.append(f)
         except (OSError, PermissionError):
             pass
         
@@ -402,18 +483,12 @@ class WatermarkDataset(Dataset):
                         files = [f for f in os.listdir(search_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
                         for f in files:
                             img_path = os.path.join(search_path, f)
-                            if os.path.exists(img_path) and (os.path.isfile(img_path) or os.path.islink(img_path)):
-                                if os.path.islink(img_path):
-                                    if os.path.exists(os.path.realpath(img_path)):
-                                        self.image_list.append(os.path.join(subdir, f))
-                                else:
-                                    self.image_list.append(os.path.join(subdir, f))
+                            if os.path.exists(img_path):
+                                self.image_list.append(f)
                         
                         if len(self.image_list) > 0:
                             # 更新 root_dir 為找到圖片的目錄
                             self.root_dir = search_path
-                            # 移除子目錄前綴，因為 root_dir 已經更新
-                            self.image_list = [f for f in files if os.path.exists(os.path.join(search_path, f)) and (os.path.isfile(os.path.join(search_path, f)) or os.path.islink(os.path.join(search_path, f)))]
                             print(f"在子目錄 {subdir} 中找到圖片文件")
                             break
                     except (OSError, PermissionError):
@@ -426,15 +501,10 @@ class WatermarkDataset(Dataset):
                 for f in files:
                     if f.lower().endswith(('.jpg', '.jpeg', '.png')):
                         img_path = os.path.join(root, f)
-                        if os.path.exists(img_path) and (os.path.isfile(img_path) or os.path.islink(img_path)):
-                            if os.path.islink(img_path):
-                                if os.path.exists(os.path.realpath(img_path)):
-                                    # 保存相對路徑
-                                    rel_path = os.path.relpath(img_path, root_dir)
-                                    self.image_list.append(rel_path)
-                            else:
-                                rel_path = os.path.relpath(img_path, root_dir)
-                                self.image_list.append(rel_path)
+                        if os.path.exists(img_path):
+                            # 保存相對路徑
+                            rel_path = os.path.relpath(img_path, root_dir)
+                            self.image_list.append(rel_path)
                 
                 # 如果找到足夠的圖片，停止搜索
                 if len(self.image_list) > 100:
@@ -447,132 +517,84 @@ class WatermarkDataset(Dataset):
                 f"常見的目錄結構: data/coco2017/train/images 或 data/coco/images/train2017"
             )
         
+        # 最終驗證：過濾掉任何 None 或無效的路徑
+        self.image_list = [f for f in self.image_list if f and isinstance(f, str) and len(f) > 0]
+        
+        if len(self.image_list) == 0:
+            raise ValueError(f"過濾後沒有有效的圖片文件！")
+        
         print(f"找到 {len(self.image_list)} 個有效的圖片文件（在 {self.root_dir}）")
         self.watermark_bits = watermark_bits
 
     def __len__(self):
         return len(self.image_list)
 
+    def _ensure_size(self, tensor):
+        """確保影像張量為 (C, 256, 256)，避免 DataLoader collate 時尺寸不一致。"""
+        if tensor.shape[-2:] != TARGET_IMAGE_SIZE:
+            tensor = F.interpolate(
+                tensor.unsqueeze(0), size=TARGET_IMAGE_SIZE, mode='bilinear', align_corners=False
+            ).squeeze(0)
+        return tensor
+
     def __getitem__(self, idx):
         import random
-        import time
         import torch
+        from PIL import Image
         
-        # 處理相對路徑和絕對路徑
-        img_file = self.image_list[idx]
-        if os.path.isabs(img_file):
-            img_path = img_file
-        else:
-            img_path = os.path.join(self.root_dir, img_file)
+        max_retries = 10
         
-        # 解析符號連結的真實路徑（解決多進程 DataLoader 中的問題）
-        if os.path.islink(img_path):
+        for attempt in range(max_retries):
             try:
-                real_path = os.path.realpath(img_path)
-                if os.path.exists(real_path):
-                    img_path = real_path
-            except (OSError, RuntimeError):
-                pass
-        
-        # 再次檢查文件是否存在（防止多進程訪問時文件被刪除）
-        max_retries = 3
-        retry_count = 0
-        while retry_count < max_retries:
-            try:
-                if not os.path.exists(img_path):
-                    # 如果文件不存在，使用一個隨機索引
-                    fallback_idx = random.randint(0, len(self.image_list) - 1)
-                    fallback_file = self.image_list[fallback_idx]
-                    if os.path.isabs(fallback_file):
-                        img_path = fallback_file
-                    else:
-                        img_path = os.path.join(self.root_dir, fallback_file)
-                    
-                    # 再次解析符號連結
-                    if os.path.islink(img_path):
-                        try:
-                            real_path = os.path.realpath(img_path)
-                            if os.path.exists(real_path):
-                                img_path = real_path
-                        except (OSError, RuntimeError):
-                            pass
+                # 選擇圖片索引（首次使用原始 idx，重試時使用隨機索引）
+                current_idx = idx if attempt == 0 else random.randint(0, len(self.image_list) - 1)
+                img_file = self.image_list[current_idx]
                 
-                # 使用更安全的方式打開圖片（解決多進程中的文件句柄問題）
-                # 先打開文件，然後傳遞給 PIL
-                with open(img_path, 'rb') as f:
-                    image = Image.open(f)
-                    # 驗證圖片是否有效（檢查 size 屬性）
-                    if image.size is None or len(image.size) < 2 or image.size[0] <= 0 or image.size[1] <= 0:
-                        raise ValueError(f"無效的圖片尺寸: {image.size}")
-                    image = image.convert('RGB')
-                    # 確保圖像數據被加載到記憶體中，避免文件句柄問題
-                    image.load()
-                    # 再次驗證圖片尺寸（load() 後）
-                    if image.size is None or len(image.size) < 2 or image.size[0] <= 0 or image.size[1] <= 0:
-                        raise ValueError(f"加載後圖片尺寸無效: {image.size}")
+                # 確保 img_file 為有效字串
+                if not isinstance(img_file, str):
+                    img_file = str(img_file) if img_file is not None else ""
                 
-                # 確保應用 transform（這很重要，確保所有圖片都是相同尺寸）
+                if not img_file:
+                    continue
+                
+                # 構建完整路徑
+                if os.path.isabs(img_file):
+                    img_path = img_file
+                else:
+                    img_path = os.path.join(self.root_dir, img_file)
+                
+                # 確保 img_path 為字串（安全性檢查）
+                if not isinstance(img_path, str):
+                    img_path = str(img_path)
+                
+                # 直接讓 Image.open() 處理路徑，移除所有 os.path.realpath/islink 檢查
+                # 這樣可以避免在多進程 DataLoader 中觸發 posixpath.py 的 UnboundLocalError
+                image = Image.open(img_path)
+                image = image.convert('RGB')
+                image.load()  # 確保圖像數據被加載到記憶體中
+                
+                # 驗證圖片是否有效
+                if image.size is None or image.size[0] <= 0 or image.size[1] <= 0:
+                    raise ValueError(f"無效的圖片尺寸")
+                
+                # 應用 transform 並確保尺寸一致
                 image_tensor = self.transform(image)
-                # 驗證 transform 後的尺寸
-                if not isinstance(image_tensor, torch.Tensor) or len(image_tensor.shape) != 3:
-                    raise ValueError(f"Transform 後圖片格式無效: {type(image_tensor)}, shape: {image_tensor.shape if hasattr(image_tensor, 'shape') else 'N/A'}")
+                image_tensor = self._ensure_size(image_tensor)
                 
                 # Random binary watermark
                 watermark = torch.randint(0, 2, (self.watermark_bits,)).float()
                 return image_tensor, watermark
                 
-            except (IOError, OSError, AttributeError, TypeError, ValueError) as e:
-                retry_count += 1
-                if retry_count >= max_retries:
-                    # 如果重試失敗，嘗試使用另一個隨機索引
-                    for fallback_attempt in range(5):  # 嘗試5次找到有效圖片
-                        fallback_idx = random.randint(0, len(self.image_list) - 1)
-                        fallback_file = self.image_list[fallback_idx]
-                        if os.path.isabs(fallback_file):
-                            fallback_path = fallback_file
-                        else:
-                            fallback_path = os.path.join(self.root_dir, fallback_file)
-                        
-                        # 解析符號連結
-                        if os.path.islink(fallback_path):
-                            try:
-                                real_path = os.path.realpath(fallback_path)
-                                if os.path.exists(real_path):
-                                    fallback_path = real_path
-                            except (OSError, RuntimeError):
-                                continue
-                        
-                        # 嘗試加載圖片
-                        try:
-                            if os.path.exists(fallback_path):
-                                with open(fallback_path, 'rb') as f:
-                                    fallback_image = Image.open(f)
-                                    # 驗證圖片是否有效
-                                    if fallback_image.size is not None and len(fallback_image.size) >= 2 and fallback_image.size[0] > 0 and fallback_image.size[1] > 0:
-                                        fallback_image = fallback_image.convert('RGB')
-                                        fallback_image.load()
-                                        # 再次驗證
-                                        if fallback_image.size is not None and len(fallback_image.size) >= 2 and fallback_image.size[0] > 0 and fallback_image.size[1] > 0:
-                                            # 確保應用 transform
-                                            fallback_tensor = self.transform(fallback_image)
-                                            # 驗證 transform 後的尺寸
-                                            if isinstance(fallback_tensor, torch.Tensor) and len(fallback_tensor.shape) == 3:
-                                                watermark = torch.randint(0, 2, (self.watermark_bits,)).float()
-                                                return fallback_tensor, watermark
-                        except (IOError, OSError, AttributeError, TypeError, ValueError) as e:
-                            continue
-                    
-                    # 如果所有嘗試都失敗，創建一個黑色圖片作為後備
-                    # 確保使用與 transform 相同的尺寸
-                    print(f"警告: 無法加載圖片 {img_path}，使用黑色圖片替代")
-                    # 創建一個 PIL Image，然後應用 transform 以確保尺寸一致
-                    fallback_pil_image = Image.new('RGB', (256, 256), color=(0, 0, 0))
-                    image = self.transform(fallback_pil_image)
-                    watermark = torch.randint(0, 2, (self.watermark_bits,)).float()
-                    return image, watermark
-                
-                # 短暫延遲後重試
-                time.sleep(0.01)
+            except Exception:
+                # 如果 Image.open 或任何步驟失敗，直接進入重試邏輯
+                continue
+        
+        # 所有重試都失敗，使用黑色圖片作為後備
+        fallback_image = Image.new('RGB', TARGET_IMAGE_SIZE, color=(0, 0, 0))
+        image_tensor = self.transform(fallback_image)
+        image_tensor = self._ensure_size(image_tensor)
+        watermark = torch.randint(0, 2, (self.watermark_bits,)).float()
+        return image_tensor, watermark
 
 # Training Function (改進版：加入驗證集、checkpoint、學習率調度)
 def train_model(epochs=100, batch_size=16, lr=1e-4, device='cuda', 
@@ -601,15 +623,8 @@ def train_model(epochs=100, batch_size=16, lr=1e-4, device='cuda',
                 # 檢查是否有有效的圖片文件（包括符號連結）
                 try:
                     files = [f for f in os.listdir(path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-                    # 檢查文件是否可讀（包括符號連結）
-                    valid_files = []
-                    for f in files[:100]:  # 只檢查前100個文件以加快速度
-                        file_path = os.path.join(path, f)
-                        # 檢查文件是否存在（符號連結也視為有效）
-                        if os.path.exists(file_path) or os.path.islink(file_path):
-                            valid_files.append(f)
-                    # 如果有有效文件，使用這個路徑
-                    if len(valid_files) > 0 or len(files) > 0:
+                    # 如果有圖片文件，使用這個路徑
+                    if len(files) > 0:
                         data_dir = path
                         total_files = len(files)
                         print(f"自動檢測到數據集路徑: {data_dir} (找到 {total_files} 個圖片文件)")
@@ -635,34 +650,30 @@ def train_model(epochs=100, batch_size=16, lr=1e-4, device='cuda',
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
     
-    # 優化 DataLoader 配置以提升訓練速度
-    # num_workers: 根據 CPU 核心數調整（32核心可用8-16）
-    # pin_memory: 加速 GPU 傳輸
-    # persistent_workers: 避免重複創建 worker（但可能與符號連結有兼容性問題）
-    # prefetch_factor: 預取更多批次以減少等待時間
-    num_workers = min(8, os.cpu_count() or 4)  # 使用8個worker（減少多進程問題）
-    # 對於符號連結文件，persistent_workers 可能會導致問題，所以設為 False
-    use_persistent_workers = False  # 禁用以避免符號連結文件句柄問題
+    # DataLoader 配置：num_workers=4 加速載入，使用 spawn 啟動方式降低 segfault 風險
+    num_workers = 4
+    pin_memory = torch.cuda.is_available()
+    use_persistent_workers = num_workers > 0  # 避免每個 epoch 重啟 worker
     
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
         shuffle=True, 
         num_workers=num_workers,
-        pin_memory=True,  # 加速 GPU 傳輸
-        persistent_workers=use_persistent_workers,  # 禁用以避免文件句柄問題
-        prefetch_factor=2 if num_workers > 0 else None  # 預取2個批次
+        pin_memory=pin_memory,
+        persistent_workers=use_persistent_workers,
+        prefetch_factor=2 if num_workers > 0 else None
     )
     val_loader = DataLoader(
         val_dataset, 
         batch_size=batch_size, 
         shuffle=False, 
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         persistent_workers=use_persistent_workers,
         prefetch_factor=2 if num_workers > 0 else None
     )
-    print(f"DataLoader 配置: num_workers={num_workers}, pin_memory=True, persistent_workers={use_persistent_workers}, prefetch_factor=2")
+    print(f"DataLoader 配置: num_workers={num_workers}, pin_memory={pin_memory}, persistent_workers={use_persistent_workers}")
 
     # 模型
     encoder = Encoder().to(device)
@@ -729,8 +740,25 @@ def train_model(epochs=100, batch_size=16, lr=1e-4, device='cuda',
     print(f"開始訓練... 訓練集: {train_size}, 驗證集: {val_size}")
     if start_epoch > 0:
         print(f"從 Epoch {start_epoch} 繼續訓練，總共 {epochs} epochs\n")
-    
+
+    # Sanity Check: Encoder to_rgb 零初始化與 residual_scale
+    with torch.no_grad():
+        to_rgb_w = encoder.to_rgb.weight
+        to_rgb_b = encoder.to_rgb.bias
+        print(f"[Sanity Check] Encoder to_rgb.weight 平均: {to_rgb_w.mean().item():.6f} (應為 0)")
+        print(f"[Sanity Check] Encoder to_rgb.bias 平均: {to_rgb_b.mean().item():.6f} (應為 0)")
+        print(f"[Sanity Check] Encoder residual_scale: {encoder.residual_scale}\n")
+
     for epoch in range(start_epoch, epochs):
+        # ============= Warm-up 機制 =============
+        # 設置 NoiseLayer 的 epoch，前 10 個 epochs 關閉攻擊
+        noise_layer.set_epoch(epoch)
+        if epoch < 10:
+            assert not noise_layer.enable_attacks, "Warm-up: noise_layer.enable_attacks 必須為 False"
+            print(f"🔥 Warm-up 階段 (Epoch {epoch+1}/10): Noise Layer 已關閉 (enable_attacks=False)，模型學習無干擾的水印嵌入與提取")
+        elif epoch == 10:
+            print(f"✅ Warm-up 完成！從 Epoch {epoch+1} 開始啟用 Noise Layer 攻擊")
+        
         # ============= 訓練階段 =============
         encoder.train()
         decoder.train()
@@ -740,19 +768,45 @@ def train_model(epochs=100, batch_size=16, lr=1e-4, device='cuda',
         train_losses = {'g_loss': 0, 'd_loss': 0, 'ber': 0, 'psnr': 0}
         num_batches = 0
         
+        # ============================================================
+        # GAN Warm-up 機制：前 10 個 Epochs 禁用 GAN
+        # ============================================================
+        # 問題診斷：WGAN-GP 與浮水印損失發生衝突
+        #   - Discriminator 懲罰 Encoder 修改圖像
+        #   - Watermark Loss 要求 Encoder 修改圖像嵌入浮水印
+        #   - 兩者衝突導致模型震盪，BER 上升
+        #
+        # 解法：分階段訓練
+        #   - Phase 1 (Epoch 1-10): 純通訊系統，只訓練 Encoder+Decoder
+        #   - Phase 2 (Epoch 11+): 加入 GAN，開始關注畫質
+        # ============================================================
+        GAN_WARMUP_EPOCHS = 10
+        gan_enabled = (epoch >= GAN_WARMUP_EPOCHS)
+        
+        if epoch == GAN_WARMUP_EPOCHS:
+            print(f"\n{'='*60}")
+            print(f"GAN Warm-up 結束！從 Epoch {epoch + 1} 開始啟用 Discriminator")
+            print(f"{'='*60}\n")
+        
         for batch_idx, (images, watermarks) in enumerate(train_loader):
             images, watermarks = images.to(device), watermarks.to(device)
             
-            # Train Discriminator (WGAN-GP)
-            for _ in range(1):  # D 訓練次數
-                opt_disc.zero_grad()
-                watermarked = encoder(images, watermarks)
-                d_real = discriminator(images)
-                d_fake = discriminator(watermarked.detach())
-                gp = wgan_gp_loss(discriminator, images, watermarked.detach())
-                d_loss = -d_real.mean() + d_fake.mean() + gp
-                d_loss.backward()
-                opt_disc.step()
+            # ============================================================
+            # Train Discriminator (WGAN-GP) — 只在 Warm-up 結束後啟用
+            # ============================================================
+            if gan_enabled:
+                for _ in range(1):  # D 訓練次數
+                    opt_disc.zero_grad()
+                    watermarked = encoder(images, watermarks)
+                    d_real = discriminator(images)
+                    d_fake = discriminator(watermarked.detach())
+                    gp = wgan_gp_loss(discriminator, images, watermarked.detach())
+                    d_loss = -d_real.mean() + d_fake.mean() + gp
+                    d_loss.backward()
+                    opt_disc.step()
+            else:
+                # Warm-up 階段：不訓練 Discriminator，d_loss 設為 0
+                d_loss = torch.tensor(0.0, device=device)
             
             # Train Generator (Encoder + Decoder)
             opt_gen.zero_grad()
@@ -764,7 +818,12 @@ def train_model(epochs=100, batch_size=16, lr=1e-4, device='cuda',
             mse_img_loss = mse_loss(watermarked, images)
             ssim_img_loss = ssim_loss(watermarked, images)
             wm_loss = bce_loss(logits, watermarks)
-            g_gan_loss = -discriminator(watermarked).mean()
+            
+            # GAN Loss — 只在 Warm-up 結束後計算
+            if gan_enabled:
+                g_gan_loss = -discriminator(watermarked).mean()
+            else:
+                g_gan_loss = torch.tensor(0.0, device=device)
             
             # VGG 感知損失
             if vgg_loss_fn is not None:
@@ -776,9 +835,35 @@ def train_model(epochs=100, batch_size=16, lr=1e-4, device='cuda',
             else:
                 img_loss = mse_img_loss + ssim_img_loss
             
-            # 總損失（調整權重以平衡畫質和水印提取）
-            g_loss = 2.0 * img_loss + 1.0 * wm_loss + 0.001 * g_gan_loss
+            # ============================================================
+            # 損失權重排程
+            # ============================================================
+            # Phase 1 (Warm-up): 純通訊系統，專注 BER
+            #   - img_weight = 0.01 (幾乎忽略畫質)
+            #   - wm_weight = 10.0 (強迫重視浮水印)
+            #   - gan_weight = 0.0 (完全禁用 GAN)
+            #
+            # Phase 2 (Epoch 11+): 加入 GAN，平衡畫質
+            #   - img_weight = 0.5 (開始關注畫質)
+            #   - wm_weight = 5.0 (維持浮水印重要性)
+            #   - gan_weight = 0.001 (啟用 GAN)
+            # ============================================================
+            if gan_enabled:
+                # Phase 2: 平衡模式
+                current_img_weight = 0.5
+                current_wm_weight = 5.0
+                current_gan_weight = 0.001
+            else:
+                # Phase 1: 純通訊系統模式
+                current_img_weight = 0.01
+                current_wm_weight = 10.0
+                current_gan_weight = 0.0
+            
+            g_loss = current_img_weight * img_loss + current_wm_weight * wm_loss + current_gan_weight * g_gan_loss
             g_loss.backward()
+            # 梯度裁剪：防止 wm_weight=10.0 導致梯度爆炸
+            torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(decoder.parameters(), max_norm=1.0)
             opt_gen.step()
             
             # 統計
@@ -793,7 +878,8 @@ def train_model(epochs=100, batch_size=16, lr=1e-4, device='cuda',
             num_batches += 1
             
             if batch_idx % 50 == 0:
-                print(f"Epoch [{epoch}/{epochs}] Batch [{batch_idx}/{len(train_loader)}] "
+                phase_str = "Phase2-GAN" if gan_enabled else "Phase1-Warmup"
+                print(f"[{phase_str}] Epoch [{epoch}/{epochs}] Batch [{batch_idx}/{len(train_loader)}] "
                       f"G_loss: {g_loss.item():.4f}, D_loss: {d_loss.item():.4f}, "
                       f"BER: {ber:.4f}, PSNR: {psnr:.2f}dB")
         
@@ -816,6 +902,8 @@ def train_model(epochs=100, batch_size=16, lr=1e-4, device='cuda',
         num_val_batches = 0
         
         with torch.no_grad():
+            # 驗證時也使用相同的 Warm-up 設置
+            noise_layer.set_epoch(epoch)
             for images, watermarks in val_loader:
                 images, watermarks = images.to(device), watermarks.to(device)
                 
@@ -973,7 +1061,7 @@ if __name__ == '__main__':
     parser.add_argument('--resume', type=str, default=None, help='從檢查點恢復訓練（訓練用）')
     parser.add_argument('--epochs', type=int, default=100, help='訓練 epochs')
     parser.add_argument('--batch', type=int, default=16, help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-4, help='學習率')
+    parser.add_argument('--lr', type=float, default=1e-4, help='學習率（預設 1e-4；配合 Zero Init 與 residual_scale）')
     parser.add_argument('--use_vgg', action='store_true', help='使用 VGG 感知損失')
     parser.add_argument('--save_dir', type=str, default='./checkpoints_improved', help='模型保存目錄')
     parser.add_argument('--data-dir', type=str, default=None, help='數據集目錄路徑（如果不指定，會自動檢測）')
