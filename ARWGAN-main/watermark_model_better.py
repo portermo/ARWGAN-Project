@@ -278,81 +278,78 @@ class NoiseLayer(nn.Module):
         return x  # No attack or fallback
 
 # ============================================================
-# Decoder (CNN 分類器架構 - 適合 Image → Bits 任務)
+# Decoder (ResNet-Style CNN 分類器)
 # ============================================================
 # 設計理念：
-#   - 移除 U-Net 的 Skip Connections 和 Upsampling
-#   - 使用純粹的下採樣 CNN，類似圖像分類器
-#   - 256x256 → 128 → 64 → 32 → 16 → 8 → GlobalPool → 64 bits
-#   - 這樣可以過濾掉圖像背景雜訊，專注於提取浮水印訊號
+#   - 移除 U-Net 的 Upsampling 和 Skip Connection
+#   - 純下採樣 CNN，專為 64-bit 分類任務設計
+#   - 簡單、直接、梯度流動順暢
 # ============================================================
 class Decoder(nn.Module):
     def __init__(self, watermark_bits=64):
         super(Decoder, self).__init__()
         self.watermark_bits = watermark_bits
         
-        # 連續下採樣 CNN（類似分類器/Discriminator）
-        # 輸入: 3x256x256
-        self.features = nn.Sequential(
-            # Block 1: 3 -> 64, 256x256 -> 256x256
-            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+        # Block 1: 3 -> 64, 256x256 (stride=1, 保持尺寸)
+        self.block1 = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True),
-            
-            # Block 2: 64 -> 64, 256x256 -> 128x128
-            nn.Conv2d(64, 64, kernel_size=3, padding=1, stride=2),
+            nn.ReLU(inplace=True),
+        )
+        
+        # Block 2: 64 -> 64, 256 -> 128 (stride=2)
+        self.block2 = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True),
-            
-            # Block 3: 64 -> 128, 128x128 -> 64x64
-            nn.Conv2d(64, 128, kernel_size=3, padding=1, stride=2),
+            nn.ReLU(inplace=True),
+        )
+        
+        # Block 3: 64 -> 128, 128 -> 64 (stride=2)
+        self.block3 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-            
-            # Block 4: 128 -> 256, 64x64 -> 32x32
-            nn.Conv2d(128, 256, kernel_size=3, padding=1, stride=2),
+            nn.ReLU(inplace=True),
+        )
+        
+        # Block 4: 128 -> 256, 64 -> 32 (stride=2)
+        self.block4 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, inplace=True),
-            
-            # Block 5: 256 -> 512, 32x32 -> 16x16
-            nn.Conv2d(256, 512, kernel_size=3, padding=1, stride=2),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2, inplace=True),
-            
-            # Block 6: 512 -> 512, 16x16 -> 8x8
-            nn.Conv2d(512, 512, kernel_size=3, padding=1, stride=2),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.ReLU(inplace=True),
         )
         
-        # Global Average Pooling: 8x8 -> 1x1
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
-        
-        # 全連接層輸出 watermark bits
-        self.classifier = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(256, watermark_bits),
+        # Block 5: 256 -> 512, 32 -> 16 (stride=2)
+        self.block5 = nn.Sequential(
+            nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
         )
+        
+        # Global Average Pooling: 16x16 -> 1x1
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Output Head: 512 -> watermark_bits
+        self.fc = nn.Linear(512, watermark_bits)
         
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # 特徵提取（連續下採樣）
-        features = self.features(x)  # (B, 512, 8, 8)
+        # 連續下採樣
+        x = self.block1(x)   # (B, 64, 256, 256)
+        x = self.block2(x)   # (B, 64, 128, 128)
+        x = self.block3(x)   # (B, 128, 64, 64)
+        x = self.block4(x)   # (B, 256, 32, 32)
+        x = self.block5(x)   # (B, 512, 16, 16)
         
-        # Global Average Pooling
-        pooled = self.global_pool(features)  # (B, 512, 1, 1)
-        pooled = pooled.view(pooled.size(0), -1)  # (B, 512)
+        # Global Aggregation
+        x = self.global_pool(x)  # (B, 512, 1, 1)
+        x = x.view(x.size(0), -1)  # (B, 512)
         
-        # 分類器輸出 logits
-        logits = self.classifier(pooled)  # (B, watermark_bits)
-        
-        # 二值化決策
+        # Output
+        logits = self.fc(x)  # (B, watermark_bits)
         extracted = (self.sigmoid(logits) > 0.5).float()
         
-        return extracted, logits  # 保持介面不變
+        return extracted, logits
 
 # Discriminator (PatchGAN for WGAN-GP)
 class Discriminator(nn.Module):
